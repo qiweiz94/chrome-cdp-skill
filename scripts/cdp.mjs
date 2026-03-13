@@ -171,10 +171,11 @@ function formatPageList(pages) {
   }).join('\n');
 }
 
-function shouldShowAxNode(node) {
+function shouldShowAxNode(node, compact = false) {
   const role = node.role?.value || '';
   const name = node.name?.value ?? '';
   const value = node.value?.value;
+  if (compact && role === 'InlineTextBox') return false;
   return role !== 'none' && role !== 'generic' && !(name === '' && (value === '' || value == null));
 }
 
@@ -208,7 +209,7 @@ function orderedAxChildren(node, nodesById, childrenByParent) {
   return children;
 }
 
-async function snapshotStr(cdp, sid) {
+async function snapshotStr(cdp, sid, compact = false) {
   const { nodes } = await cdp.send('Accessibility.getFullAXTree', {}, sid);
   const nodesById = new Map(nodes.map(node => [node.nodeId, node]));
   const childrenByParent = new Map();
@@ -223,7 +224,7 @@ async function snapshotStr(cdp, sid) {
   function visit(node, depth) {
     if (!node || visited.has(node.nodeId)) return;
     visited.add(node.nodeId);
-    if (shouldShowAxNode(node)) lines.push(formatAxNode(node, depth));
+    if (shouldShowAxNode(node, compact)) lines.push(formatAxNode(node, depth));
     for (const child of orderedAxChildren(node, nodesById, childrenByParent)) {
       visit(child, depth + 1);
     }
@@ -249,10 +250,41 @@ async function evalStr(cdp, sid, expression) {
 }
 
 async function shotStr(cdp, sid, filePath) {
+  // Get device scale factor so we can report coordinate mapping
+  let dpr = 1;
+  try {
+    const metrics = await cdp.send('Page.getLayoutMetrics', {}, sid);
+    dpr = metrics.visualViewport?.clientWidth
+      ? metrics.cssVisualViewport?.clientWidth
+        ? Math.round((metrics.visualViewport.clientWidth / metrics.cssVisualViewport.clientWidth) * 100) / 100
+        : 1
+      : 1;
+    // Simpler: deviceScaleFactor is on the root Page metrics
+    const { deviceScaleFactor } = await cdp.send('Emulation.getDeviceMetricsOverride', {}, sid).catch(() => ({}));
+    if (deviceScaleFactor) dpr = deviceScaleFactor;
+  } catch {}
+  // Fallback: try to get DPR from JS
+  if (dpr === 1) {
+    try {
+      const raw = await evalStr(cdp, sid, 'window.devicePixelRatio');
+      const parsed = parseFloat(raw);
+      if (parsed > 0) dpr = parsed;
+    } catch {}
+  }
+
   const { data } = await cdp.send('Page.captureScreenshot', { format: 'png' }, sid);
   const out = filePath || '/tmp/screenshot.png';
   writeFileSync(out, Buffer.from(data, 'base64'));
-  return out;
+
+  const lines = [out];
+  lines.push(`Screenshot saved. Device pixel ratio (DPR): ${dpr}`);
+  lines.push(`Coordinate mapping:`);
+  lines.push(`  Screenshot pixels → CSS pixels (for CDP Input events): divide by ${dpr}`);
+  lines.push(`  e.g. screenshot point (${Math.round(100 * dpr)}, ${Math.round(200 * dpr)}) → CSS (100, 200) → use clickxy <target> 100 200`);
+  if (dpr !== 1) {
+    lines.push(`  On this ${dpr}x display: CSS px = screenshot px / ${dpr} ≈ screenshot px × ${Math.round(100/dpr)/100}`);
+  }
+  return lines.join('\n');
 }
 
 async function htmlStr(cdp, sid, selector) {
@@ -311,6 +343,83 @@ async function netStr(cdp, sid) {
   return JSON.parse(raw).map(e =>
     `${String(e.duration).padStart(5)}ms  ${String(e.size || '?').padStart(8)}B  ${e.type.padEnd(8)}  ${e.name}`
   ).join('\n');
+}
+
+// Click element by CSS selector
+async function clickStr(cdp, sid, selector) {
+  if (!selector) throw new Error('CSS selector required');
+  const expr = `
+    (function() {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) return { ok: false, error: 'Element not found: ' + ${JSON.stringify(selector)} };
+      el.scrollIntoView({ block: 'center' });
+      el.click();
+      return { ok: true, tag: el.tagName, text: el.textContent.trim().substring(0, 80) };
+    })()
+  `;
+  const result = await evalStr(cdp, sid, expr);
+  const r = JSON.parse(result);
+  if (!r.ok) throw new Error(r.error);
+  return `Clicked <${r.tag}> "${r.text}"`;
+}
+
+// Click at CSS pixel coordinates using Input.dispatchMouseEvent
+async function clickXyStr(cdp, sid, x, y) {
+  const cx = parseFloat(x);
+  const cy = parseFloat(y);
+  if (isNaN(cx) || isNaN(cy)) throw new Error('x and y must be numbers (CSS pixels)');
+  const base = { x: cx, y: cy, button: 'left', clickCount: 1, modifiers: 0 };
+  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseMoved' }, sid);
+  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed' }, sid);
+  await sleep(50);
+  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' }, sid);
+  return `Clicked at CSS (${cx}, ${cy})`;
+}
+
+// Type text using Input.insertText (works in cross-origin iframes, unlike eval)
+async function typeStr(cdp, sid, text) {
+  if (text == null || text === '') throw new Error('text required');
+  await cdp.send('Input.insertText', { text }, sid);
+  return `Typed ${text.length} characters`;
+}
+
+// Load-more: repeatedly click a button/selector until it disappears
+async function loadAllStr(cdp, sid, selector, intervalMs = 1500) {
+  if (!selector) throw new Error('CSS selector required');
+  let clicks = 0;
+  const deadline = Date.now() + 5 * 60 * 1000; // 5-minute hard cap
+  while (Date.now() < deadline) {
+    const exists = await evalStr(cdp, sid,
+      `!!document.querySelector(${JSON.stringify(selector)})`
+    );
+    if (exists !== 'true') break;
+    const clickExpr = `
+      (function() {
+        const el = document.querySelector(${JSON.stringify(selector)});
+        if (!el) return false;
+        el.scrollIntoView({ block: 'center' });
+        el.click();
+        return true;
+      })()
+    `;
+    const clicked = await evalStr(cdp, sid, clickExpr);
+    if (clicked !== 'true') break;
+    clicks++;
+    await sleep(intervalMs);
+  }
+  return `Clicked "${selector}" ${clicks} time(s) until it disappeared`;
+}
+
+// Send a raw CDP command and return the result as JSON
+async function evalRawStr(cdp, sid, method, paramsJson) {
+  if (!method) throw new Error('CDP method required (e.g. "DOM.getDocument")');
+  let params = {};
+  if (paramsJson) {
+    try { params = JSON.parse(paramsJson); }
+    catch { throw new Error(`Invalid JSON params: ${paramsJson}`); }
+  }
+  const result = await cdp.send(method, params, sid);
+  return JSON.stringify(result, null, 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -383,12 +492,17 @@ async function runDaemon(targetId) {
           result = JSON.stringify(pages);
           break;
         }
-        case 'snap': case 'snapshot': result = await snapshotStr(cdp, sessionId); break;
+        case 'snap': case 'snapshot': result = await snapshotStr(cdp, sessionId, true); break;
         case 'eval': result = await evalStr(cdp, sessionId, args[0]); break;
         case 'shot': case 'screenshot': result = await shotStr(cdp, sessionId, args[0]); break;
         case 'html': result = await htmlStr(cdp, sessionId, args[0]); break;
         case 'nav': case 'navigate': result = await navStr(cdp, sessionId, args[0]); break;
         case 'net': case 'network': result = await netStr(cdp, sessionId); break;
+        case 'click': result = await clickStr(cdp, sessionId, args[0]); break;
+        case 'clickxy': result = await clickXyStr(cdp, sessionId, args[0], args[1]); break;
+        case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
+        case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
+        case 'evalraw': result = await evalRawStr(cdp, sessionId, args[0], args[1]); break;
         case 'stop': return { ok: true, result: '', stopAfter: true };
         default: return { ok: false, error: `Unknown command: ${cmd}` };
       }
@@ -399,6 +513,10 @@ async function runDaemon(targetId) {
   }
 
   // Unix socket server — NDJSON protocol
+  // Wire format: each message is one JSON object followed by \n (newline-delimited JSON).
+  // Request:  { "id": <number>, "cmd": "<command>", "args": ["arg1", "arg2", ...] }
+  // Response: { "id": <number>, "ok": <boolean>, "result": "<string>" }
+  //           or { "id": <number>, "ok": false, "error": "<message>" }
   const server = net.createServer((conn) => {
     let buf = '';
     conn.on('data', (chunk) => {
@@ -556,20 +674,58 @@ const USAGE = `cdp - lightweight Chrome DevTools Protocol CLI (no Puppeteer)
 
 Usage: cdp <command> [args]
 
-  list                        List open pages (shows unique target prefixes)
-  snap  <target> [file]       Accessibility tree snapshot
-  eval  <target> <expr>       Evaluate JS expression
-  shot  <target> [file]       Screenshot (default: /tmp/screenshot.png)
-  html  <target> [selector]   Get HTML (full page or CSS selector)
-  nav   <target> <url>        Navigate to URL and wait for load completion
-  net   <target>              Network performance entries
-  stop  [target]              Stop daemon(s)
+  list                              List open pages (shows unique target prefixes)
+  snap  <target>                    Accessibility tree snapshot
+  eval  <target> <expr>             Evaluate JS expression
+  shot  <target> [file]             Screenshot (default: /tmp/screenshot.png); prints coordinate mapping
+  html  <target> [selector]         Get HTML (full page or CSS selector)
+  nav   <target> <url>              Navigate to URL and wait for load completion
+  net   <target>                    Network performance entries
+  click   <target> <selector>       Click an element by CSS selector
+  clickxy <target> <x> <y>          Click at CSS pixel coordinates (see coordinate note below)
+  type    <target> <text>           Type text at current focus via Input.insertText
+                                    Works in cross-origin iframes unlike eval-based approaches
+  loadall <target> <selector> [ms]  Repeatedly click a "load more" button until it disappears
+                                    Optional interval in ms between clicks (default 1500)
+  evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
+                                    e.g. evalraw <t> "DOM.getDocument" '{}'
+  stop  [target]                    Stop daemon(s)
 
 <target> is a unique targetId prefix from "cdp list". If a prefix is ambiguous,
 use more characters.
+
+COORDINATE SYSTEM
+  shot captures the viewport at the device's native resolution.
+  The screenshot image size = CSS pixels × DPR (device pixel ratio).
+  For CDP Input events (clickxy, etc.) you need CSS pixels, not image pixels.
+
+    CSS pixels = screenshot image pixels / DPR
+
+  shot prints the DPR and an example conversion for the current page.
+  Typical Retina (DPR=2): CSS px ≈ screenshot px × 0.5
+  If your viewer rescales the image further, account for that scaling too.
+
+EVAL SAFETY NOTE
+  Avoid index-based DOM selection (querySelectorAll(...)[i]) across multiple
+  eval calls when the list can change between calls (e.g. after clicking
+  "Ignore" buttons on a feed — indices shift). Prefer stable selectors or
+  collect all data in a single eval.
+
+DAEMON IPC (for advanced use / scripting)
+  Each tab runs a persistent daemon at Unix socket: /tmp/cdp-<fullTargetId>.sock
+  Protocol: newline-delimited JSON (one JSON object per line, UTF-8).
+    Request:  {"id":<number>, "cmd":"<command>", "args":["arg1","arg2",...]}
+    Response: {"id":<number>, "ok":true,  "result":"<string>"}
+           or {"id":<number>, "ok":false, "error":"<message>"}
+  Commands mirror the CLI: snap, eval, shot, html, nav, net, click, clickxy,
+  type, loadall, evalraw, stop. Use evalraw to send arbitrary CDP methods.
+  The socket disappears after 20 min of inactivity or when the tab closes.
 `;
 
-const NEEDS_TARGET = new Set(['snap','snapshot','eval','shot','screenshot','html','nav','navigate','net','network']);
+const NEEDS_TARGET = new Set([
+  'snap','snapshot','eval','shot','screenshot','html','nav','navigate',
+  'net','network','click','clickxy','type','loadall','evalraw',
+]);
 
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);
@@ -643,11 +799,22 @@ async function main() {
   const conn = await getOrStartTabDaemon(targetId);
 
   const cmdArgs = args.slice(1);
+
   if (cmd === 'eval') {
     const expr = cmdArgs.join(' ');
     if (!expr) { console.error('Error: expression required'); process.exit(1); }
     cmdArgs[0] = expr;
+  } else if (cmd === 'type') {
+    // Join all remaining args as text (allows spaces)
+    const text = cmdArgs.join(' ');
+    if (!text) { console.error('Error: text required'); process.exit(1); }
+    cmdArgs[0] = text;
+  } else if (cmd === 'evalraw') {
+    // args: [method, ...jsonParts] — join json parts in case of spaces
+    if (!cmdArgs[0]) { console.error('Error: CDP method required'); process.exit(1); }
+    if (cmdArgs.length > 2) cmdArgs[1] = cmdArgs.slice(1).join(' ');
   }
+
   if ((cmd === 'nav' || cmd === 'navigate') && !cmdArgs[0]) {
     console.error('Error: URL required');
     process.exit(1);

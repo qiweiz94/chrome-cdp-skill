@@ -22,14 +22,13 @@ All commands use `scripts/cdp.mjs`. The `<target>` is a **unique** targetId pref
 scripts/cdp.mjs list
 ```
 
-`list` shows enough targetId characters to disambiguate the currently open tabs.
-
 ### Take a screenshot
 
 ```bash
-scripts/cdp.mjs shot <target>                    # saves to /tmp/screenshot.png
-scripts/cdp.mjs shot <target> /tmp/myshot.png    # custom path
+scripts/cdp.mjs shot <target> [file]    # default: /tmp/screenshot.png
 ```
+
+Captures the **viewport only**. Scroll first with `eval` if you need content below the fold. Output includes the page's DPR and coordinate conversion hint (see **Coordinates** below).
 
 ### Accessibility tree snapshot
 
@@ -37,51 +36,40 @@ scripts/cdp.mjs shot <target> /tmp/myshot.png    # custom path
 scripts/cdp.mjs snap <target>
 ```
 
-Returns a text representation of the page's accessibility tree — useful for understanding page structure without rendering.
-
 ### Evaluate JavaScript
 
 ```bash
-scripts/cdp.mjs eval <target> document.title
-scripts/cdp.mjs eval <target> "JSON.stringify([...document.querySelectorAll('h1')].map(e => e.textContent))"
+scripts/cdp.mjs eval <target> <expr>
 ```
 
-Expressions are evaluated in the page context. Return values must be JSON-serializable.
+> **Watch out:** avoid index-based selection (`querySelectorAll(...)[i]`) across multiple `eval` calls when the DOM can change between them (e.g. after clicking Ignore, card indices shift). Collect all data in one `eval` or use stable selectors.
 
-### Get HTML
+### Other commands
 
 ```bash
-scripts/cdp.mjs html <target>                    # full page HTML
-scripts/cdp.mjs html <target> ".sidebar"        # specific CSS selector
+scripts/cdp.mjs html    <target> [selector]   # full page or element HTML
+scripts/cdp.mjs nav     <target> <url>         # navigate and wait for load
+scripts/cdp.mjs net     <target>               # resource timing entries
+scripts/cdp.mjs click   <target> <selector>    # click element by CSS selector
+scripts/cdp.mjs clickxy <target> <x> <y>       # click at CSS pixel coords
+scripts/cdp.mjs type    <target> <text>         # Input.insertText at current focus; works in cross-origin iframes unlike eval
+scripts/cdp.mjs loadall <target> <selector> [ms]  # click "load more" until gone (default 1500ms between clicks)
+scripts/cdp.mjs evalraw <target> <method> [json]  # raw CDP command passthrough
+scripts/cdp.mjs stop    [target]               # stop daemon(s)
 ```
 
-### Navigate
+## Coordinates
 
-```bash
-scripts/cdp.mjs nav <target> https://example.com
+`shot` saves an image at native resolution: image pixels = CSS pixels × DPR. CDP Input events (`clickxy` etc.) take **CSS pixels**.
+
+```
+CSS px = screenshot image px / DPR
 ```
 
-Waits for the navigation to finish loading and reports CDP navigation errors.
-
-### Network performance entries
-
-```bash
-scripts/cdp.mjs net <target>
-```
-
-Shows resource timing entries (duration, transfer size, initiator type).
-
-### Stop daemons
-
-```bash
-scripts/cdp.mjs stop           # stop all tab daemons
-scripts/cdp.mjs stop <target>  # stop daemon for specific tab
-```
+`shot` prints the DPR for the current page. Typical Retina (DPR=2): divide screenshot coords by 2.
 
 ## Tips
 
-- Use `list` to find which page to target. Copy the full prefix shown in the list output.
-- For large pages, prefer `snap` over `html` — it's more compact and gives semantic structure.
-- Use `eval` for targeted data extraction rather than pulling full HTML.
-- Screenshots are useful for visual state verification — use the `read` tool to view the saved PNG.
-- Chrome shows an "Allow debugging" modal once per tab on first access. A background daemon keeps the session alive so subsequent commands to the same tab need no further approval. Daemons auto-exit after 20 minutes of inactivity.
+- Prefer `snap --compact` over `html` for page structure.
+- Use `type` (not eval) to enter text in cross-origin iframes — `click`/`clickxy` to focus first, then `type`.
+- Chrome shows an "Allow debugging" modal once per tab on first access. A background daemon keeps the session alive so subsequent commands need no further approval. Daemons auto-exit after 20 minutes of inactivity.
