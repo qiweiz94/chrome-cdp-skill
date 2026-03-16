@@ -28,7 +28,7 @@ Clone or copy the `skills/chrome-cdp/` directory wherever your agent loads skill
 
 Navigate to `chrome://inspect/#remote-debugging` and toggle the switch. That's it.
 
-The CLI auto-detects Chrome, Chromium, Brave, Edge, and Vivaldi on macOS and Linux. If your browser stores `DevToolsActivePort` in a non-standard location, set the `CDP_PORT_FILE` environment variable to the full path.
+The CLI auto-detects Chrome, Chromium, Brave, Edge, and Vivaldi on macOS, Linux, and Windows. If your browser stores `DevToolsActivePort` in a non-standard location, set the `CDP_PORT_FILE` environment variable to the full path.
 
 ## Usage
 
