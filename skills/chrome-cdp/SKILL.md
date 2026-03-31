@@ -7,11 +7,21 @@ description: Interact with local Chrome browser session (only on explicit user a
 
 Lightweight Chrome DevTools Protocol CLI. Connects directly via WebSocket — no Puppeteer, works with 100+ tabs, instant connection.
 
+## Security posture
+
+- Safe mode, recommended: use a dedicated debug profile or Chrome for Testing with a non-default `user-data-dir`.
+- Live-session mode: attach to your normal logged-in browser only when you explicitly accept that this exposes current authenticated tabs to the agent using the skill.
+- `eval` runs arbitrary JavaScript in the page.
+- `evalraw` sends arbitrary CDP commands.
+- `CDP_HOST` only accepts loopback hosts by default. Set `CDP_ALLOW_REMOTE_HOST=1` only when you intentionally want to connect to a remote DevTools endpoint and accept that this leaves the local-only trust model.
+- On Windows, named-pipe isolation depends on platform defaults; treat this as same-user local tooling unless you have verified your host's pipe ACLs.
+
 ## Prerequisites
 
 - Chrome (or Chromium, Brave, Edge, Vivaldi) with remote debugging enabled: open `chrome://inspect/#remote-debugging` and toggle the switch
 - Node.js 22+ (uses built-in WebSocket)
 - If your browser's `DevToolsActivePort` is in a non-standard location, set `CDP_PORT_FILE` to its full path
+- Prefer an isolated debug profile instead of your daily browser profile unless you intentionally need live-session access
 
 ## Commands
 
@@ -59,6 +69,8 @@ scripts/cdp.mjs evalraw <target> <method> [json]  # raw CDP command passthrough
 scripts/cdp.mjs open    [url]                  # open new tab (each triggers Allow prompt)
 scripts/cdp.mjs stop    [target]               # stop daemon(s)
 ```
+
+`open [url]` accepts only `http://...`, `https://...`, or no URL, which opens `about:blank`.
 
 ## Coordinates
 

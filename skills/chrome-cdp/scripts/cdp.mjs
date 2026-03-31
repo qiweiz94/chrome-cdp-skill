@@ -12,6 +12,7 @@ import { homedir } from 'os';
 import { resolve } from 'path';
 import { spawn } from 'child_process';
 import net from 'net';
+import { formatHostForWebSocket, validateCdpHost, validateNavUrl, validateOpenUrl } from './security.mjs';
 
 const TIMEOUT = 15000;
 const NAVIGATION_TIMEOUT = 30000;
@@ -83,8 +84,8 @@ function getWsUrl() {
   if (!portFile) throw new Error('No DevToolsActivePort found. Enable remote debugging at chrome://inspect/#remote-debugging');
   const lines = readFileSync(portFile, 'utf8').trim().split('\n');
   if (lines.length < 2 || !lines[0] || !lines[1]) throw new Error(`Invalid DevToolsActivePort file: ${portFile}`);
-  const host = process.env.CDP_HOST || '127.0.0.1';
-  return `ws://${host}:${lines[0]}${lines[1]}`;
+  const host = validateCdpHost(process.env.CDP_HOST, process.env.CDP_ALLOW_REMOTE_HOST === '1');
+  return `ws://${formatHostForWebSocket(host)}:${lines[0]}${lines[1]}`;
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -368,17 +369,10 @@ async function waitForDocumentReady(cdp, sid, timeoutMs = NAVIGATION_TIMEOUT) {
 }
 
 async function navStr(cdp, sid, url) {
-  try {
-    const parsed = new URL(url);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
-      throw new Error(`Only http/https URLs allowed, got: ${url}`);
-  } catch (e) {
-    if (e.message.startsWith('Only')) throw e;
-    throw new Error(`Invalid URL: ${url}`);
-  }
+  const safeUrl = validateNavUrl(url);
   await cdp.send('Page.enable', {}, sid);
   const loadEvent = cdp.waitForEvent('Page.loadEventFired', NAVIGATION_TIMEOUT);
-  const result = await cdp.send('Page.navigate', { url }, sid);
+  const result = await cdp.send('Page.navigate', { url: safeUrl }, sid);
   if (result.errorText) {
     loadEvent.cancel();
     throw new Error(result.errorText);
@@ -389,7 +383,7 @@ async function navStr(cdp, sid, url) {
     loadEvent.cancel();
   }
   await waitForDocumentReady(cdp, sid, 5000);
-  return `Navigated to ${url}`;
+  return `Navigated to ${safeUrl}`;
 }
 
 async function netStr(cdp, sid) {
@@ -802,7 +796,7 @@ async function main() {
 
   // Open new tab
   if (cmd === 'open') {
-    const url = args[0] || 'about:blank';
+    const url = validateOpenUrl(args[0]);
     const cdp = new CDP();
     await cdp.connect(getWsUrl());
     const { targetId } = await cdp.send('Target.createTarget', { url });
